@@ -16,3 +16,16 @@ patch:
         patched: '2019-06-25T18:24:49.326Z'
     - eth-block-tracker > eth-json-rpc-infura > eth-json-rpc-middleware > eth-tx-summary > web3-provider-engine > request > extend:
         patched: '2019-06-25T18:24:49.326Z'
+  SNYK-JS-LODASH-450202:
+    - snyk > lodash:
+        patched: '2019-07-03T23:10:05.853Z'
+    - snyk > inquirer > lodash:
+        patched: '2019-07-03T23:10:05.853Z'
+    - snyk > snyk-config > lodash:
+        patched: '2019-07-03T23:10:05.853Z'
+    - snyk > snyk-mvn-plugin > lodash:
+        patched: '2019-07-03T23:10:05.853Z'
+    - snyk > snyk-nodejs-lockfile-parser > lodash:
+        patched: '2019-07-03T23:10:05.853Z'
+    - snyk > snyk-php-plugin > @snyk/composer-lockfile-parser > lodash:
+        patched: '2019-07-03T23:10:05.853Z'
