@@ -1,116 +1,194 @@
-version: 2
+version: 2.1
+
+executors:
+  node-browsers:
+    docker:
+      - image: circleci/node:14-browsers
+  node-browsers-medium-plus:
+    docker:
+      - image: circleci/node:14-browsers
+    resource_class: medium+
+    environment:
+      NODE_OPTIONS: --max_old_space_size=2048
+  shellcheck:
+    docker:
+      - image: koalaman/shellcheck-alpine@sha256:35882cba254810c7de458528011e935ba2c4f3ebcb224275dfa7ebfa930ef294
 
 workflows:
-  version: 2
-  full_test:
+  test_and_release:
     jobs:
-      - prep-deps-npm
+      - create_release_pull_request:
+          requires:
+            - prep-deps
+          filters:
+            branches:
+              only:
+                - /^Version-v(\d+)[.](\d+)[.](\d+)/
+      - prep-deps
+      - test-deps
+      - validate-lavamoat-config:
+          filters:
+            branches:
+              only:
+                - /^Version-v(\d+)[.](\d+)[.](\d+)|master/
+          requires:
+            - prep-deps
       - prep-build:
           requires:
-            - prep-deps-npm
-      - prep-docs:
+            - prep-deps
+      - prep-build-test:
           requires:
-            - prep-deps-npm
-      - prep-scss:
+            - prep-deps
+      - prep-build-test-metrics:
           requires:
-            - prep-deps-npm
+            - prep-deps
+      - prep-build-storybook:
+          requires:
+            - prep-deps
       - test-lint:
           requires:
-            - prep-deps-npm
-      - test-deps:
+            - prep-deps
+      - test-lint-shellcheck
+      - test-lint-lockfile:
           requires:
-            - prep-deps-npm
-      - test-e2e-beta-chrome:
+            - prep-deps
+      - test-lint-changelog:
           requires:
-            - prep-deps-npm
-            - prep-build
-      - test-e2e-beta-firefox:
+            - prep-deps
+      - test-e2e-chrome:
           requires:
-            - prep-deps-npm
-            - prep-build
-      # - test-e2e-beta-drizzle:
-      #     requires:
-      #       - prep-deps-npm
-      #       - prep-build
+            - prep-build-test
+      - test-e2e-firefox:
+          requires:
+            - prep-build-test
+      - test-e2e-chrome-metrics:
+          requires:
+            - prep-build-test-metrics
+      - test-e2e-firefox-metrics:
+          requires:
+            - prep-build-test-metrics
       - test-unit:
           requires:
-            - prep-deps-npm
+            - prep-deps
+      - test-unit-global:
+          requires:
+            - prep-deps
+      - validate-source-maps:
+          requires:
+            - prep-build
       - test-mozilla-lint:
           requires:
-            - prep-deps-npm
+            - prep-deps
             - prep-build
-      - test-integration-flat-chrome:
-          requires:
-            - prep-deps-npm
-            - prep-scss
-      - test-integration-flat-firefox:
-          requires:
-            - prep-deps-npm
-            - prep-scss
       - all-tests-pass:
           requires:
+            - validate-lavamoat-config
             - test-lint
+            - test-lint-shellcheck
+            - test-lint-lockfile
+            - test-lint-changelog
             - test-unit
+            - test-unit-global
+            - validate-source-maps
             - test-mozilla-lint
-            - test-e2e-beta-chrome
-            - test-e2e-beta-firefox
-            # - test-e2e-beta-drizzle
-            - test-integration-flat-chrome
-            - test-integration-flat-firefox
-      - job-screens:
+            - test-e2e-chrome
+            - test-e2e-firefox
+            - test-e2e-chrome-metrics
+            - test-e2e-firefox-metrics
+      - benchmark:
           requires:
-            - prep-deps-npm
-            - prep-build
-            - all-tests-pass
+            - prep-build-test
       - job-publish-prerelease:
           requires:
-            - prep-deps-npm
+            - prep-deps
             - prep-build
-            - job-screens
+            - prep-build-storybook
+            - benchmark
             - all-tests-pass
       - job-publish-release:
           filters:
             branches:
               only: master
           requires:
-            - prep-deps-npm
+            - prep-deps
             - prep-build
-            - prep-docs
-            - job-screens
             - all-tests-pass
+      - job-publish-storybook:
+          filters:
+            branches:
+              only: develop
+          requires:
+            - prep-build-storybook
 
 jobs:
-  prep-deps-npm:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+  create_release_pull_request:
+    executor: node-browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Bump manifest version
+          command: .circleci/scripts/release-bump-manifest-version.sh
+      - run:
+          name: Update changelog
+          command: yarn update-changelog --rc
+      - run:
+          name: Commit changes
+          command: .circleci/scripts/release-commit-version-bump.sh
+      - run:
+          name: Create GitHub Pull Request for version
+          command: .circleci/scripts/release-create-release-pr.sh
+
+  prep-deps:
+    executor: node-browsers
     steps:
       - checkout
       - restore_cache:
-          keys:
-            - v1.0-dependency-cache-{{ checksum "package-lock.json" }}
+          key: dependency-cache-v1-{{ checksum "yarn.lock" }}
       - run:
-          name: Install npm 6 + deps via npm
+          name: Install deps
           command: |
-           sudo npm install -g npm@6 && npm install --no-save --no-audit
+            .circleci/scripts/deps-install.sh
+      - save_cache:
+          key: dependency-cache-v1-{{ checksum "yarn.lock" }}
+          paths:
+            - node_modules/
+            - build-artifacts/yarn-install-har/
+      - run:
+          name: Postinstall
+          command: |
+            yarn setup:postinstall
       - persist_to_workspace:
           root: .
           paths:
           - node_modules
-      - save_cache:
-          key: v1.0-dependency-cache-{{ checksum "package-lock.json" }}
-          paths:
-            - node_modules
+          - build-artifacts
+
+  validate-lavamoat-config:
+    executor: node-browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Validate allow-scripts config
+          command: |
+            .circleci/scripts/validate-allow-scripts.sh
+      - run:
+          name: Validate LavaMoat policy
+          command: |
+            .circleci/scripts/validate-lavamoat-policy.sh
 
   prep-build:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers-medium-plus
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
           name: build:dist
-          command: npm run dist
+          command: yarn dist
       - run:
           name: build:debug
           command: find dist/ -type f -exec md5sum {} \; | sort -k 2
@@ -120,128 +198,274 @@ jobs:
             - dist
             - builds
 
-  prep-docs:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+  prep-build-test:
+    executor: node-browsers-medium-plus
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
-          name: build:dist
-          command: npm run doc
+          name: Build extension for testing
+          command: yarn build:test
+      - run:
+          name: Move test build to 'dist-test' to avoid conflict with production build
+          command: mv ./dist ./dist-test
+      - run:
+          name: Move test zips to 'builds-test' to avoid conflict with production build
+          command: mv ./builds ./builds-test
       - persist_to_workspace:
           root: .
           paths:
-            - docs/jsdocs
+            - dist-test
+            - builds-test
 
-  prep-scss:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+  prep-build-test-metrics:
+    executor: node-browsers-medium-plus
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
-          name: Get Scss Cache key
-          # this allows us to checksum against a whole directory
-          command: find ui/app/css -type f -exec md5sum {} \; | sort -k 2 > scss_checksum
+          name: Build extension for testing metrics
+          command: yarn build:test:metrics
       - run:
-          name: Build for integration tests
-          command: npm run test:integration:build
+          name: Move test build to 'dist-test-metrics' to avoid conflict with production build
+          command: mv ./dist ./dist-test-metrics
+      - run:
+          name: Move test zips to 'builds-test' to avoid conflict with production build
+          command: mv ./builds ./builds-test-metrics
       - persist_to_workspace:
           root: .
           paths:
-            - ui/app/css/output
+            - dist-test-metrics
+            - builds-test-metrics
+
+  prep-build-storybook:
+    executor: node-browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build Storybook
+          command: yarn storybook:build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - storybook-build
 
   test-lint:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
-          name: Test
-          command: npm run lint
+          name: Lint
+          command: yarn lint
+      - run:
+          name: Verify locales
+          command: yarn verify-locales --quiet
+
+  test-lint-shellcheck:
+    executor: shellcheck
+    steps:
+      - checkout
+      - run: apk add --no-cache bash jq yarn
+      - run:
+          name: ShellCheck Lint
+          command: ./development/shellcheck.sh
+
+  test-lint-lockfile:
+    executor: node-browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: lockfile-lint
+          command: yarn lint:lockfile
+
+  test-lint-changelog:
+    executor: node-browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - when:
+          condition:
+            not:
+              matches:
+                pattern: /^Version-v(\d+)[.](\d+)[.](\d+)$/
+                value: << pipeline.git.branch >>
+          steps:
+            - run:
+                name: Validate changelog
+                command: yarn auto-changelog validate
+      - when:
+          condition:
+            matches:
+              pattern: /^Version-v(\d+)[.](\d+)[.](\d+)$/
+              value: << pipeline.git.branch >>
+          steps:
+            - run:
+                name: Validate release candidate changelog
+                command: yarn auto-changelog validate --rc
+
 
   test-deps:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
-          name: Test
-          command: sudo npm install -g npm@6 && npm audit
+          name: yarn audit
+          command: .circleci/scripts/yarn-audit.sh
 
-  # test-e2e-beta-drizzle:
-  #   docker:
-  #     - image: circleci/node:8.11.3-browsers
-  #   steps:
-  #     - checkout
-  #     - attach_workspace:
-  #         at: .
-  #     - run:
-  #         name: test:e2e:drizzle:beta
-  #         command: npm run test:e2e:drizzle:beta
-  #     - store_artifacts:
-  #         path: test-artifacts
-  #         destination: test-artifacts
-  test-e2e-beta-chrome:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+  test-e2e-chrome:
+    executor: node-browsers
     steps:
       - checkout
+      - run:
+          name: Re-Install Chrome
+          command: ./.circleci/scripts/chrome-install.sh
       - attach_workspace:
           at: .
       - run:
-          name: test:e2e:chrome:beta
-          command: npm run test:e2e:chrome:beta
+          name: Move test build to dist
+          command: mv ./dist-test ./dist
+      - run:
+          name: Move test zips to builds
+          command: mv ./builds-test ./builds
+      - run:
+          name: test:e2e:chrome
+          command: |
+            if .circleci/scripts/test-run-e2e.sh
+            then
+              yarn test:e2e:chrome --retries 2
+            fi
+          no_output_timeout: 20m
       - store_artifacts:
           path: test-artifacts
           destination: test-artifacts
 
-  test-e2e-beta-firefox:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+  test-e2e-chrome-metrics:
+    executor: node-browsers
+    steps:
+      - checkout
+      - run:
+          name: Re-Install Chrome
+          command: ./.circleci/scripts/chrome-install.sh
+      - attach_workspace:
+          at: .
+      - run:
+          name: Move test build to dist
+          command: mv ./dist-test-metrics ./dist
+      - run:
+          name: Move test zips to builds
+          command: mv ./builds-test-metrics ./builds
+      - run:
+          name: test:e2e:chrome:metrics
+          command: |
+            if .circleci/scripts/test-run-e2e.sh
+            then
+              yarn test:e2e:chrome:metrics --retries 2
+            fi
+          no_output_timeout: 20m
+      - store_artifacts:
+          path: test-artifacts
+          destination: test-artifacts
+
+  test-e2e-firefox:
+    executor: node-browsers
     steps:
       - checkout
       - run:
           name: Install Firefox
-          command: ./.circleci/scripts/firefox-install
+          command: ./.circleci/scripts/firefox-install.sh
       - attach_workspace:
           at: .
       - run:
-          name: test:e2e:firefox:beta
-          command: npm run test:e2e:firefox:beta
+          name: Move test build to dist
+          command: mv ./dist-test ./dist
+      - run:
+          name: Move test zips to builds
+          command: mv ./builds-test ./builds
+      - run:
+          name: test:e2e:firefox
+          command: |
+            if .circleci/scripts/test-run-e2e.sh
+            then
+              yarn test:e2e:firefox --retries 2
+            fi
+          no_output_timeout: 20m
       - store_artifacts:
           path: test-artifacts
           destination: test-artifacts
 
-  job-screens:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+  test-e2e-firefox-metrics:
+    executor: node-browsers
     steps:
       - checkout
+      - run:
+          name: Install Firefox
+          command: ./.circleci/scripts/firefox-install.sh
       - attach_workspace:
           at: .
       - run:
-          name: Test
-          command: npm run test:screens
+          name: Move test build to dist
+          command: mv ./dist-test-metrics ./dist
+      - run:
+          name: Move test zips to builds
+          command: mv ./builds-test-metrics ./builds
+      - run:
+          name: test:e2e:firefox:metrics
+          command: |
+            if .circleci/scripts/test-run-e2e.sh
+            then
+              yarn test:e2e:firefox:metrics --retries 2
+            fi
+          no_output_timeout: 20m
+      - store_artifacts:
+          path: test-artifacts
+          destination: test-artifacts
+
+  benchmark:
+    executor: node-browsers-medium-plus
+    steps:
+      - checkout
+      - run:
+          name: Re-Install Chrome
+          command: ./.circleci/scripts/chrome-install.sh
+      - attach_workspace:
+          at: .
+      - run:
+          name: Move test build to dist
+          command: mv ./dist-test ./dist
+      - run:
+          name: Move test zips to builds
+          command: mv ./builds-test ./builds
+      - run:
+          name: Run page load benchmark
+          command: yarn benchmark:chrome --out test-artifacts/chrome/benchmark/pageload.json --retries 2
+      - store_artifacts:
+          path: test-artifacts
+          destination: test-artifacts
       - persist_to_workspace:
           root: .
           paths:
             - test-artifacts
 
   job-publish-prerelease:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers
     steps:
       - checkout
       - attach_workspace:
           at: .
+      - run:
+          name: build:source-map-explorer
+          command: ./development/source-map-explorer.sh
       - store_artifacts:
           path: dist/sourcemaps
           destination: builds/sourcemaps
@@ -249,107 +473,109 @@ jobs:
           path: builds
           destination: builds
       - store_artifacts:
+          path: coverage
+          destination: coverage
+      - store_artifacts:
+          path: jest-coverage
+          destination: jest-coverage
+      - store_artifacts:
           path: test-artifacts
           destination: test-artifacts
+      # important: generate lavamoat viz AFTER uploading builds as artifacts
+      # Temporarily disabled until we can update to a version of `sesify` with
+      # this fix included: https://github.com/LavaMoat/LavaMoat/pull/121
+      - run:
+          name: build:lavamoat-viz
+          command: ./.circleci/scripts/create-lavamoat-viz.sh
+      - store_artifacts:
+          path: build-artifacts
+          destination: build-artifacts
+      - store_artifacts:
+          path: storybook-build
+          destination: storybook
       - run:
           name: build:announce
           command: ./development/metamaskbot-build-announce.js
 
   job-publish-release:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
           name: sentry sourcemaps upload
-          command: npm run sentry:publish
+          command: SENTRY_ORG=metamask SENTRY_PROJECT=metamask yarn sentry:publish
       - run:
-          name: github gh-pages docs publish
-          command: >
-            git config --global user.name "metamaskbot" &&
-            git config --global user.email "admin@metamask.io" &&
-            npm run publish-docs
+          name: Create GitHub release
+          command: |
+            .circleci/scripts/release-create-gh-release.sh
+
+  job-publish-storybook:
+    executor: node-browsers
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "3d:49:29:f4:b2:e8:ea:af:d1:32:eb:2a:fc:15:85:d8"
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: storybook:deploy
+          command: |
+            git remote add storybook git@github.com:MetaMask/metamask-storybook.git
+            yarn storybook:deploy
 
   test-unit:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
           name: test:coverage
-          command: npm run test:coverage
+          command: yarn test:coverage
+      - run:
+          name: test:coverage:jest
+          command: yarn test:coverage:jest
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .nyc_output
+            - coverage
+            - jest-coverage
+  test-unit-global:
+    executor: node-browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: test:unit:global
+          command: yarn test:unit:global
+
+  validate-source-maps:
+    executor: node-browsers
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Validate source maps
+          command: yarn validate-source-maps
+
   test-mozilla-lint:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers
     steps:
       - checkout
       - attach_workspace:
           at: .
       - run:
           name: test:mozilla-lint
-          command: npm run mozilla-lint
-
-  test-integration-flat-firefox:
-    docker:
-      - image: circleci/node:8.11.3-browsers
-    steps:
-      - checkout
-      - attach_workspace:
-          at: .
-      - run:
-          name: Install Firefox
-          command: ./.circleci/scripts/firefox-install
-      - run:
-          name: test:integration:flat
-          command: npm run test:flat
-
-  test-integration-flat-chrome:
-    environment:
-      browsers: '["Chrome"]'
-    docker:
-      - image: circleci/node:8.11.3-browsers
-    steps:
-      - checkout
-      - attach_workspace:
-          at: .
-      - run:
-          name: test:integration:flat
-          command: npm run test:flat
-
-  test-integration-mascara-firefox:
-    docker:
-      - image: circleci/node:8.11.3-browsers
-    steps:
-      - checkout
-      - attach_workspace:
-          at: .
-      - run:
-          name: Install Firefox
-          command: ./.circleci/scripts/firefox-install
-      - run:
-          name: test:integration:mascara
-          command: npm run test:mascara
-
-  test-integration-mascara-chrome:
-    environment:
-      browsers: '["Chrome"]'
-    docker:
-      - image: circleci/node:8.11.3-browsers
-    steps:
-      - checkout
-      - attach_workspace:
-          at: .
-      - run:
-          name: test:integration:mascara
-          command: npm run test:mascara
+          command: NODE_OPTIONS=--max_old_space_size=3072 yarn mozilla-lint
 
   all-tests-pass:
-    docker:
-      - image: circleci/node:8.11.3-browsers
+    executor: node-browsers
     steps:
       - run:
           name: All Tests Passed

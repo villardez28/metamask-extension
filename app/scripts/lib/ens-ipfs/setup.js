@@ -1,63 +1,91 @@
-const urlUtil = require('url')
-const extension = require('extensionizer')
-const resolveEnsToIpfsContentId = require('./resolver.js')
+import extension from 'extensionizer';
+import getFetchWithTimeout from '../../../../shared/modules/fetch-with-timeout';
+import { SECOND } from '../../../../shared/constants/time';
+import resolveEnsToIpfsContentId from './resolver';
 
-const supportedTopLevelDomains = ['eth']
+const fetchWithTimeout = getFetchWithTimeout(SECOND * 30);
 
-module.exports = setupEnsIpfsResolver
+const supportedTopLevelDomains = ['eth'];
 
-function setupEnsIpfsResolver ({ provider }) {
-
+export default function setupEnsIpfsResolver({
+  provider,
+  getCurrentChainId,
+  getIpfsGateway,
+}) {
   // install listener
-  const urlPatterns = supportedTopLevelDomains.map(tld => `*://*.${tld}/*`)
-  extension.webRequest.onErrorOccurred.addListener(webRequestDidFail, { urls: urlPatterns })
+  const urlPatterns = supportedTopLevelDomains.map((tld) => `*://*.${tld}/*`);
+  extension.webRequest.onErrorOccurred.addListener(webRequestDidFail, {
+    urls: urlPatterns,
+    types: ['main_frame'],
+  });
 
   // return api object
   return {
     // uninstall listener
-    remove () {
-      extension.webRequest.onErrorOccurred.removeListener(webRequestDidFail)
+    remove() {
+      extension.webRequest.onErrorOccurred.removeListener(webRequestDidFail);
     },
-  }
+  };
 
-  async function webRequestDidFail (details) {
-    const { tabId, url } = details
+  async function webRequestDidFail(details) {
+    const { tabId, url } = details;
     // ignore requests that are not associated with tabs
-    if (tabId === -1) return
+    // only attempt ENS resolution on mainnet
+    if (tabId === -1 || getCurrentChainId() !== '0x1') {
+      return;
+    }
     // parse ens name
-    const urlData = urlUtil.parse(url)
-    const { hostname: name, path, search } = urlData
-    const domainParts = name.split('.')
-    const topLevelDomain = domainParts[domainParts.length - 1]
+    const { hostname: name, pathname, search, hash: fragment } = new URL(url);
+    const domainParts = name.split('.');
+    const topLevelDomain = domainParts[domainParts.length - 1];
     // if unsupported TLD, abort
-    if (!supportedTopLevelDomains.includes(topLevelDomain)) return
+    if (!supportedTopLevelDomains.includes(topLevelDomain)) {
+      return;
+    }
     // otherwise attempt resolve
-    attemptResolve({ tabId, name, path, search })
+    attemptResolve({ tabId, name, pathname, search, fragment });
   }
 
-  async function attemptResolve ({ tabId, name, path, search }) {
-    extension.tabs.update(tabId, { url: `loading.html` })
+  async function attemptResolve({ tabId, name, pathname, search, fragment }) {
+    const ipfsGateway = getIpfsGateway();
+    extension.tabs.update(tabId, { url: `loading.html` });
+    let url = `https://app.ens.domains/name/${name}`;
     try {
-      const ipfsContentId = await resolveEnsToIpfsContentId({ provider, name })
-      const url = `https://gateway.ipfs.io/ipfs/${ipfsContentId}${path}${search || ''}`
-      try {
-        // check if ipfs gateway has result
-        const response = await fetch(url, { method: 'HEAD' })
-        // if failure, redirect to 404 page
-        if (response.status !== 200) {
-          extension.tabs.update(tabId, { url: '404.html' })
-          return
+      const { type, hash } = await resolveEnsToIpfsContentId({
+        provider,
+        name,
+      });
+      if (type === 'ipfs-ns' || type === 'ipns-ns') {
+        const resolvedUrl = `https://${hash}.${type.slice(
+          0,
+          4,
+        )}.${ipfsGateway}${pathname}${search || ''}${fragment || ''}`;
+        try {
+          // check if ipfs gateway has result
+          const response = await fetchWithTimeout(resolvedUrl, {
+            method: 'HEAD',
+          });
+          if (response.status === 200) {
+            url = resolvedUrl;
+          }
+        } catch (err) {
+          console.warn(err);
         }
-        // otherwise redirect to the correct page
-        extension.tabs.update(tabId, { url })
-      } catch (err) {
-        console.warn(err)
-        // if HEAD fetch failed, redirect so user can see relevant error page
-        extension.tabs.update(tabId, { url })
+      } else if (type === 'swarm-ns') {
+        url = `https://swarm-gateways.net/bzz:/${hash}${pathname}${
+          search || ''
+        }${fragment || ''}`;
+      } else if (type === 'onion' || type === 'onion3') {
+        url = `http://${hash}.onion${pathname}${search || ''}${fragment || ''}`;
+      } else if (type === 'zeronet') {
+        url = `http://127.0.0.1:43110/${hash}${pathname}${search || ''}${
+          fragment || ''
+        }`;
       }
     } catch (err) {
-      console.warn(err)
-      extension.tabs.update(tabId, { url: `error.html?name=${name}` })
+      console.warn(err);
+    } finally {
+      extension.tabs.update(tabId, { url });
     }
   }
 }
